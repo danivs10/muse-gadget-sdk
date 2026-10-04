@@ -138,4 +138,38 @@ menu "Muse"
             them. Needs PSRAM. Without it, voice notes go over Home Link's own
             session to its paired VM and replies are shown as text.
 
+    config MUSE_TTS_LOKUTOR
+        bool "Speak replies with Lokutor Versa (text-to-speech API)"
+        depends on MUSE_HATCH
+        default n
+        help
+            Sends each reply's text to Lokutor's TTS API
+            (POST https://api.lokutor.com/tts/synthesize) and plays the audio
+            on the speaker, at its volume, with captions following. Needs a
+            Lokutor API key (free at https://app.lokutor.com). Replies are still
+            shown as text if the request fails. The key is stored in the firmware
+            image, like the SDK token: treat it as an identifier, not a secret
+            you can't rotate, and revoke it from the Lokutor dashboard if it
+            leaks. Off by default: builds without it are unchanged.
+
+    config MUSE_TTS_LOKUTOR_API_KEY
+        string "Lokutor API key"
+        depends on MUSE_TTS_LOKUTOR
+        default ""
+
+    config MUSE_TTS_LOKUTOR_LANGUAGE
+        string "Language code"
+        depends on MUSE_TTS_LOKUTOR
+        default "es"
+        help
+            One of en, es, ca, gl, eu, pt, fr, it, de.
+
+    config MUSE_TTS_LOKUTOR_VOICE
+        string "Voice id"
+        depends on MUSE_TTS_LOKUTOR
+        default "F1"
+        help
+            A voice id from https://api.lokutor.com/voices (F1 to F5 female,
+            M1 to M5 male, usable in every language).
+
 endmenu
