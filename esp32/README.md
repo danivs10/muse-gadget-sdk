@@ -227,6 +227,15 @@ things you can change:
   is the spot: it has the reply text, and the MP3 decoder, speaker and volume
   are already wired up there.
 
+  Lokutor Versa is built in as an option. In `idf.py menuconfig`, under Muse,
+  turn on "Speak replies with Lokutor Versa", then set your Lokutor API key
+  (free at <https://app.lokutor.com>), a language (`es`, `en`, `ca`, `gl`,
+  `eu`, `pt`, `fr`, `it`, `de`) and a voice id (`F1` to `F5`, `M1` to `M5`).
+  Each reply is sent to Lokutor's `/tts/synthesize` endpoint and its audio
+  plays on the speaker. It needs PSRAM, and replies stay text if the request
+  fails. Lokutor returns 44.1 kHz PCM, so this path does not use the MP3
+  decoder.
+
 A few things worth knowing:
 
 - Your SDK token ships inside the firmware, so treat it as an identifier
