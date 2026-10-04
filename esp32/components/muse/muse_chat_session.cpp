@@ -56,6 +56,10 @@
 #include "esp_random.h"
 #include "esp_timer.h"
 #include "esp_tls.h"
+#if CONFIG_MUSE_TTS_LOKUTOR
+#include "esp_crt_bundle.h"
+#include "esp_http_client.h"
+#endif
 #include "freertos/FreeRTOS.h"
 #include "freertos/idf_additions.h"
 #include "freertos/queue.h"
@@ -949,8 +953,15 @@ static void turn_reset_streams(void)
     }
 }
 
+#if CONFIG_MUSE_TTS_LOKUTOR
+static void lok_cancel(void);
+#endif
+
 static void turn_finish(void)
 {
+#if CONFIG_MUSE_TTS_LOKUTOR
+    lok_cancel();
+#endif
     turn_reset_streams();
     s_turn.phase = P_IDLE;
     s_turn.dict_id = s_turn.chat_id = 0;
@@ -1492,6 +1503,216 @@ static void on_chat_ack(stream_t *s)
 
 /* ---- Turn: speech ---- */
 
+
+#if CONFIG_MUSE_TTS_LOKUTOR
+/*
+ * ---- Optional: spoken replies from Lokutor Versa (CONFIG_MUSE_TTS_LOKUTOR) ----
+ *
+ * Lokutor's REST endpoint (POST https://api.lokutor.com/tts/synthesize) returns
+ * 16-bit mono PCM in a WAV at 44.1 kHz, not MP3. So this path skips the MP3
+ * decoder: a small task streams the WAV body into s_lok_buf, and lok_decode()
+ * resamples it to MIC_RATE and hands it to the voice task like decode() does.
+ * The task only ever writes s_lok_buf; every other piece of turn state stays on
+ * this task. If the request fails before any audio arrives, the reply is shown
+ * as text as it is without this option.
+ */
+#define LOK_RATE 44100
+#define LOK_BUF (48 * 1024)                /* WAV bytes in flight (~0.55 s) */
+#define LOK_WAV_HEADER 44                  /* canonical RIFF/fmt/data header */
+#define LOK_STACK (12 * 1024)
+
+static StreamBufferHandle_t s_lok_buf;
+static std::atomic<bool> s_lok_cancel{false};
+static std::atomic<bool> s_lok_running{false};
+static std::atomic<int> s_lok_result{0};          /* 0 running, 1 ok, -1 failed */
+static std::atomic<uint32_t> s_lok_wav_bytes{0};   /* Content-Length, if sent */
+static std::atomic<uint32_t> s_lok_audio_bytes{0}; /* PCM bytes written so far */
+static resampler_t s_lok_down;
+static uint8_t s_lok_carry[2];
+static size_t s_lok_carry_len;
+
+struct lok_job_t {
+    char *text;
+};
+
+static void lok_task(void *arg)
+{
+    lok_job_t *job = (lok_job_t *)arg;
+    int result = -1;
+    char *body = nullptr;
+    esp_http_client_handle_t http = nullptr;
+    uint8_t *chunk = (uint8_t *)malloc(2048);
+    do {
+        cJSON *req = cJSON_CreateObject();
+        if (!req || !chunk) {
+            cJSON_Delete(req);
+            break;
+        }
+        cJSON_AddStringToObject(req, "text", job->text);
+        cJSON_AddStringToObject(req, "voice", CONFIG_MUSE_TTS_LOKUTOR_VOICE);
+        cJSON_AddStringToObject(req, "language", CONFIG_MUSE_TTS_LOKUTOR_LANGUAGE);
+        body = cJSON_PrintUnformatted(req);
+        cJSON_Delete(req);
+        if (!body) {
+            break;
+        }
+        esp_http_client_config_t cfg = {};
+        cfg.url = "https://api.lokutor.com/tts/synthesize";
+        cfg.method = HTTP_METHOD_POST;
+        cfg.timeout_ms = 8000;
+        cfg.crt_bundle_attach = esp_crt_bundle_attach;
+        cfg.buffer_size = 1024;
+        cfg.buffer_size_tx = 1024;
+        http = esp_http_client_init(&cfg);
+        if (!http) {
+            break;
+        }
+        esp_http_client_set_header(http, "Content-Type", "application/json");
+        esp_http_client_set_header(http, "X-API-Key", CONFIG_MUSE_TTS_LOKUTOR_API_KEY);
+        int blen = (int)strlen(body);
+        if (esp_http_client_open(http, blen) != ESP_OK ||
+            esp_http_client_write(http, body, blen) != blen) {
+            ESP_LOGW(TAG, "lokutor tts: request failed");
+            break;
+        }
+        int64_t total = esp_http_client_fetch_headers(http);
+        int status = esp_http_client_get_status_code(http);
+        if (status != 200) {
+            ESP_LOGW(TAG, "lokutor tts: HTTP %d", status);
+            break;
+        }
+        if (total > LOK_WAV_HEADER) {
+            s_lok_wav_bytes.store((uint32_t)total);
+        }
+        size_t skip = LOK_WAV_HEADER;
+        const int64_t deadline = esp_timer_get_time() + 30 * 1000000LL;
+        while (!s_lok_cancel.load() && esp_timer_get_time() < deadline) {
+            int n = esp_http_client_read(http, (char *)chunk, 2048);
+            if (n < 0) {
+                ESP_LOGW(TAG, "lokutor tts: read error");
+                break;
+            }
+            if (n == 0) {
+                if (esp_http_client_is_complete_data_received(http)) {
+                    result = 1;
+                    break;
+                }
+                continue;
+            }
+            size_t off = 0;
+            if (skip) {
+                off = (size_t)n < skip ? (size_t)n : skip;
+                skip -= off;
+            }
+            while (off < (size_t)n && !s_lok_cancel.load()) {
+                size_t sent = xStreamBufferSend(s_lok_buf, chunk + off, n - off, pdMS_TO_TICKS(100));
+                off += sent;
+                s_lok_audio_bytes.fetch_add((uint32_t)sent);
+            }
+        }
+    } while (false);
+    if (http) {
+        esp_http_client_cleanup(http);
+    }
+    free(body);
+    free(chunk);
+    free(job->text);
+    free(job);
+    s_lok_result.store(result);
+    s_lok_running.store(false);
+    vTaskDeleteWithCaps(nullptr);
+}
+
+/* Starts fetching speech for the message's text. False: nothing started, show it as text. */
+static bool lok_begin(const char *text)
+{
+    if (!text || !text[0] || !s_lok_buf || s_lok_running.load()) {
+        return false;
+    }
+    lok_job_t *job = (lok_job_t *)calloc(1, sizeof(*job));
+    if (!job) {
+        return false;
+    }
+    job->text = strdup(text);
+    if (!job->text) {
+        free(job);
+        return false;
+    }
+    xStreamBufferReset(s_lok_buf);
+    s_lok_cancel.store(false);
+    s_lok_result.store(0);
+    s_lok_wav_bytes.store(0);
+    s_lok_audio_bytes.store(0);
+    s_lok_running.store(true);
+    TaskHandle_t task;
+    if (xTaskCreatePinnedToCoreWithCaps(lok_task, "lokutor_tts", LOK_STACK, job, 4, &task, 0,
+                                        MALLOC_CAP_SPIRAM) != pdPASS) {
+        s_lok_running.store(false);
+        free(job->text);
+        free(job);
+        return false;
+    }
+    resampler_init(&s_lok_down, LOK_RATE, MIC_RATE);
+    s_lok_carry_len = 0;
+    return true;
+}
+
+static void lok_cancel(void)
+{
+    s_lok_cancel.store(true);
+}
+
+/* Counterpart of decode() for the PCM that lok_task streams in. */
+static void lok_decode(void)
+{
+    static int16_t in[512];
+    static int16_t out[512 * MIC_RATE / LOK_RATE + 8];
+    msg_t &m = s_turn.msgs[s_turn.tts_msg];
+    for (;;) {
+        if (xStreamBufferSpacesAvailable(s_out) < sizeof(out)) {
+            return;
+        }
+        size_t have = s_lok_carry_len;
+        memcpy(in, s_lok_carry, have);
+        size_t got = xStreamBufferReceive(s_lok_buf, (uint8_t *)in + have, sizeof(in) - have, 0);
+        size_t bytes = have + got;
+        s_lok_carry_len = bytes & 1;
+        if (s_lok_carry_len) {
+            s_lok_carry[0] = ((uint8_t *)in)[bytes - 1];
+        }
+        size_t samples = bytes / 2;
+        if (!samples) {
+            break;
+        }
+        size_t n = resample(&s_lok_down, in, samples, out);
+        if (s_turn.gen == s_gen.load()) {
+            mark(M_AUDIO);
+            xStreamBufferSend(s_out, out, n * sizeof(int16_t), 0);
+        }
+        s_turn.pcm_out += n;
+    }
+    int result = s_lok_result.load();
+    if (result && xStreamBufferIsEmpty(s_lok_buf)) {
+        if (result < 0 && s_turn.pcm_out == m.pcm_start) {
+            /* Failed before any audio: fall back to the text, paced silently. */
+            m.pcm_frames = (uint32_t)(m.len * MIC_RATE / TEXT_CHARS_PER_S);
+            s_turn.silent = true;
+            show_reply_start(m);
+            return;
+        }
+        m.pcm_frames = s_turn.pcm_out - m.pcm_start;
+        m.tts = TTS_FINISHED;
+        s_turn.tts_msg = -1;
+        return;
+    }
+    uint32_t wav = s_lok_wav_bytes.load();
+    if (wav > LOK_WAV_HEADER) {
+        /* Content-Length tells how long the whole reply is, so captions can be timed to it. */
+        m.pcm_frames = (uint32_t)((uint64_t)(wav - LOK_WAV_HEADER) / 2 * MIC_RATE / LOK_RATE);
+    }
+}
+#endif /* CONFIG_MUSE_TTS_LOKUTOR */
+
 static void start_tts(void)
 {
     if (s_turn.tts_msg >= 0) {
@@ -1517,6 +1738,17 @@ static void start_tts(void)
          * end. decode() plays it at the speaker's volume, captions following,
          * and finishes the message once it's drained.
          */
+#if CONFIG_MUSE_TTS_LOKUTOR
+        if (s_turn.texts && lok_begin(s_turn.texts + i * TEXT_MAX)) {
+            m.pcm_start = s_turn.pcm_out;
+            m.pcm_frames = (uint32_t)(m.len * MIC_RATE / TEXT_CHARS_PER_S);   /* until Content-Length says */
+            m.tts = TTS_ACTIVE;
+            s_turn.tts_msg = i;
+            s_turn.silent = false;
+            ESP_LOGI(TAG, "speaking message %s with Lokutor (%u chars)", m.id, (unsigned)m.len);
+            return;
+        }
+#endif
         m.pcm_start = s_turn.pcm_out;
         m.pcm_frames = (uint32_t)(m.len * MIC_RATE / TEXT_CHARS_PER_S);
         m.tts = TTS_ACTIVE;
@@ -1582,6 +1814,14 @@ static void decode(void)
         pace_silently();
         return;
     }
+#if CONFIG_MUSE_TTS_LOKUTOR
+    lok_decode();
+    if (!s_turn.silent || s_turn.tts_msg < 0) {
+        return;
+    }
+    pace_silently();   /* Lokutor failed before any audio: the text stands in */
+    return;
+#endif
     /*
      * minimp3 only takes a frame once it can see the next one's header. Given
      * less, it resets and says to skip all of it, which drops speech and clicks.
@@ -2027,6 +2267,9 @@ extern "C" void muse_hatch_start(void)
     s_events = xQueueCreate(16, sizeof(ev_t));
     s_in = xStreamBufferCreateWithCaps(IN_BYTES, 1, MALLOC_CAP_SPIRAM);
     s_out = xStreamBufferCreateWithCaps(OUT_BYTES, 1, MALLOC_CAP_SPIRAM);
+#if CONFIG_MUSE_TTS_LOKUTOR
+    s_lok_buf = xStreamBufferCreateWithCaps(LOK_BUF, 1, MALLOC_CAP_SPIRAM);   /* without it replies stay text */
+#endif
     s_turn.chunk = static_cast<uint8_t *>(psram_alloc(DICT_CHUNK_BYTES + sizeof(MUSE_HATCH_NOTE_TAIL)));
     s_turn.mp3 = static_cast<uint8_t *>(psram_alloc(MP3_BUF));
     s_turn.note = VOICE_NOTE ? static_cast<uint8_t *>(psram_alloc(NOTE_PART_BYTES)) : nullptr;
